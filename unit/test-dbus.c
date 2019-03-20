@@ -35,21 +35,25 @@
 #define WAIT_ANY (-1) /* Any process */
 #endif
 
-#define TEST_BUS_ADDRESS "unix:path=/tmp/ell-test-bus"
+//#define TEST_BUS_ADDRESS "unix:path=/tmp/ell-test-bus"
+
+#define TEST_BUS_ADDRESS "tcp:host=localhost,port=55556"
 
 static pid_t dbus_daemon_pid = -1;
 
 static void start_dbus_daemon(void)
 {
-	char *prg_argv[5];
+	char *prg_argv[6];
 	char *prg_envp[1];
 	pid_t pid;
 
 	prg_argv[0] = "/usr/bin/dbus-daemon";
 	prg_argv[1] = "--nopidfile";
 	prg_argv[2] = "--nofork";
+//	prg_argv[3] = "--config-file=../knot-service-source/docker/system.conf";
 	prg_argv[3] = "--config-file=" UNITDIR "dbus.conf";
-	prg_argv[4] = NULL;
+	prg_argv[4] = "--print-address";
+	prg_argv[5] = NULL;
 
 	prg_envp[0] = NULL;
 
@@ -217,6 +221,9 @@ int main(int argc, char *argv[])
 		dbus = l_dbus_new(TEST_BUS_ADDRESS);
 		if (dbus)
 			break;
+		else
+			l_error("It was not possible to connect with the address " TEST_BUS_ADDRESS);
+
 	}
 
 	sigchld = l_signal_create(SIGCHLD, sigchld_handler, NULL, NULL);
