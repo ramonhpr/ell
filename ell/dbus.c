@@ -31,8 +31,10 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
 #include <errno.h>
 
 #include "util.h"
@@ -43,6 +45,7 @@
 #include "dbus.h"
 #include "private.h"
 #include "dbus-private.h"
+#include "main.h"
 
 #define DEFAULT_SYSTEM_BUS_ADDRESS "unix:path=/var/run/dbus/system_bus_socket"
 
@@ -75,6 +78,7 @@ struct l_dbus_ops {
 struct l_dbus {
 	struct l_io *io;
 	char *guid;
+	char *transport;
 	bool negotiate_unix_fd;
 	bool support_unix_fd;
 	bool is_ready;
@@ -466,7 +470,8 @@ static bool auth_read_handler(struct l_io *io, void *user_data)
 				return false;
 
 			break;
-		}
+		} else if (len == 0)
+			close(fd);
 
 		offset += len;
 	}
@@ -511,7 +516,10 @@ static bool auth_read_handler(struct l_io *io, void *user_data)
 		} else if (!strncmp(ptr, "REJECTED ", 9)) {
 			static const char *command = "AUTH ANONYMOUS\r\n";
 
-			dbus->negotiate_unix_fd = true;
+			if (!strcmp(dbus->transport, "unix"))
+				dbus->negotiate_unix_fd = true;
+			else
+				dbus->negotiate_unix_fd = false;
 
 			classic->auth_command = l_strdup(command);
 			classic->auth_state = WAITING_FOR_OK;
@@ -680,6 +688,8 @@ static struct l_dbus_message *classic_recv_message(struct l_dbus *dbus)
 	len = recv(fd, &hdr, DBUS_HEADER_SIZE, MSG_PEEK | MSG_DONTWAIT);
 	if (len != DBUS_HEADER_SIZE)
 		return NULL;
+	else if (len == 0)
+		close(fd);
 
 	header_size = align_len(DBUS_HEADER_SIZE + hdr.dbus1.field_length, 8);
 	header = l_malloc(header_size);
@@ -1033,7 +1043,8 @@ static const struct l_dbus_ops classic_ops = {
 	.name_acquire = classic_name_acquire,
 };
 
-static struct l_dbus *setup_dbus1(int fd, const char *guid)
+static struct l_dbus *setup_dbus1(int fd, const char *guid,
+				  const char *transport)
 {
 	static const unsigned char creds = 0x00;
 	char uid[6], hexuid[12], *ptr = hexuid;
@@ -1065,11 +1076,13 @@ static struct l_dbus *setup_dbus1(int fd, const char *guid)
 
 	dbus_init(dbus, fd);
 	dbus->guid = l_strdup(guid);
+	dbus->transport = l_strdup(transport);
 
 	classic->auth_command = l_strdup_printf("AUTH EXTERNAL %s\r\n", hexuid);
 	classic->auth_state = WAITING_FOR_OK;
 
-	dbus->negotiate_unix_fd = true;
+	if (!strcmp(transport, "unix"))
+		dbus->negotiate_unix_fd = true;
 	dbus->support_unix_fd = false;
 
 	l_io_set_read_handler(dbus->io, auth_read_handler, dbus, NULL);
@@ -1145,7 +1158,105 @@ static struct l_dbus *setup_unix(char *params)
 		return NULL;
 	}
 
-	return setup_dbus1(fd, guid);
+	return setup_dbus1(fd, guid, "unix");
+}
+
+static bool on_tcp_connected(struct l_io *io, void *user_data)
+{
+	bool *is_connected = user_data;
+
+	*is_connected = true;
+
+	return true;
+}
+
+static struct l_dbus *setup_tcp(char *params)
+{
+	struct addrinfo hints;
+	struct addrinfo *results, *rp;
+	struct l_io *io_connect;
+	char *host = NULL, *port = NULL, *family = NULL, *guid = NULL;
+	unsigned long port_number;
+	bool is_connected = false;
+	int err;
+	int fd = -1;
+
+	while (params) {
+		char *key = strsep(&params, ",");
+		char *value;
+
+		if (!key)
+			break;
+
+		value = strchr(key, '=');
+		if (!value)
+			continue;
+
+		*value++ = '\0';
+
+		if (!strcmp(key, "host"))
+			host = value;
+		else if (!strcmp(key, "port"))
+			port = value;
+		else if (!strcmp(key, "family"))
+			family = value;
+		else if (!strcmp(key, "guid"))
+			guid = value;
+	}
+
+	if (!host || !port)
+		return NULL;
+
+	port_number = strtoul(port, NULL, 10);
+
+	if (port_number == 0 || port_number >= 65536)
+		return NULL;
+
+	memset(&hints, 0, sizeof(hints));
+
+	hints.ai_family = AF_UNSPEC;
+	if (family) {
+		if (!strcmp(family, "ipv4"))
+			hints.ai_family = AF_INET;
+		else if (!strcmp(family, "ipv6"))
+			hints.ai_family = AF_INET6;
+	}
+
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = 0;
+	hints.ai_protocol = 0;
+
+	if (getaddrinfo(host, port, &hints, &results) != 0)
+		return NULL;
+
+	for (rp = results, is_connected = false;
+	     rp != NULL && !is_connected; rp = rp->ai_next) {
+		fd = socket(rp->ai_family, rp->ai_socktype | SOCK_NONBLOCK,
+			    rp->ai_protocol);
+		if (fd < 0)
+			continue;
+
+		if (!connect(fd, rp->ai_addr, rp->ai_addrlen))
+			break;
+
+		err = errno;
+
+		if (err != EINPROGRESS) {
+			close(fd);
+			continue;
+		}
+
+		io_connect = l_io_new(fd);
+		l_io_set_write_handler(io_connect,
+				       on_tcp_connected, &is_connected, NULL);
+		l_main_iterate(1000);
+		if (is_connected)
+			l_io_destroy(io_connect);
+	}
+
+	freeaddrinfo(results);
+
+	return setup_dbus1(fd, guid, "tcp");
 }
 
 static struct l_dbus *setup_address(const char *address)
@@ -1169,6 +1280,9 @@ static struct l_dbus *setup_address(const char *address)
 		if (!strcmp(transport, "unix")) {
 			/* Function will modify params string */
 			dbus = setup_unix(params);
+			break;
+		} else if (!strcmp(transport, "tcp")) {
+			dbus = setup_tcp(params);
 			break;
 		}
 	}
@@ -1232,6 +1346,7 @@ LIB_EXPORT void l_dbus_destroy(struct l_dbus *dbus)
 
 	l_free(dbus->guid);
 	l_free(dbus->unique_name);
+	l_free(dbus->transport);
 
 	_dbus_object_tree_free(dbus->tree);
 
