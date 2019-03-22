@@ -175,6 +175,7 @@ unit_tests = unit/test-unit \
 
 dbus_tests = unit/test-hwdb \
 			unit/test-dbus \
+			unit/test-dbus-tcp \
 			unit/test-dbus-util \
 			unit/test-dbus-message \
 			unit/test-dbus-message-fds \
@@ -242,6 +243,8 @@ unit_test_genl_LDADD = ell/libell-private.la
 unit_test_genl_msg_LDADD = ell/libell-private.la
 
 unit_test_dbus_LDADD = ell/libell-private.la
+
+unit_test_dbus_tcp_LDADD = ell/libell-private.la
 
 unit_test_dbus_message_LDADD = ell/libell-private.la
 
